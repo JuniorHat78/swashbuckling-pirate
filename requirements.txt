@@ -1,0 +1,7 @@
+numpy==2.4.2
+pandas==2.3.1
+pyarrow==22.0.0
+duckdb==1.5.4
+numba==0.68.1
+llvmlite==0.50.0
+cryptography==42.0.8

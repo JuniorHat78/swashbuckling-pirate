@@ -1,0 +1,169 @@
+name: run
+run-name: ${{ inputs.label }}
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        required: true
+        type: string
+      shards:
+        required: true
+        default: '1'
+        type: string
+      code_tag:
+        required: true
+        type: string
+      data_tag:
+        required: true
+        type: string
+      shard_indices:
+        description: optional JSON list of shard indices to (re)run
+        required: false
+        default: ''
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: run-${{ inputs.label }}
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+env:
+  PYTHONUNBUFFERED: '1'
+  RT: /home/runner/rt
+  NUMBA_CACHE_DIR: /home/runner/.nbc
+  MM_BUNDLE_DIR: /home/runner/data
+jobs:
+  prime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - id: plan
+        env:
+          LABEL: ${{ inputs.label }}
+          COUNT: ${{ inputs.shards }}
+          INDICES: ${{ inputs.shard_indices }}
+          CODE: ${{ inputs.code_tag }}
+          DATA: ${{ inputs.data_tag }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          assert re.fullmatch(r'r[0-9a-f]{12}', os.environ['LABEL'])
+          assert re.fullmatch(r'c[0-9a-f]{16}', os.environ['CODE'])
+          assert re.fullmatch(r'd[0-9a-f]{16}', os.environ['DATA'])
+          n = int(os.environ['COUNT']); assert 1 <= n <= 256
+          idx = json.loads(os.environ['INDICES']) if os.environ['INDICES'] else list(range(n))
+          assert idx and len(set(idx)) == len(idx) and all(type(i) is int and 0 <= i < n for i in idx)
+          open(os.environ['GITHUB_OUTPUT'], 'a').write('shards=' + json.dumps(idx) + '\n')
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: python -m pip install --disable-pip-version-check -q -r requirements.txt
+      - id: data
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/data
+          key: ${{ inputs.data_tag }}
+      - if: steps.data.outputs.cache-hit != 'true'
+        name: data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOX_KEY: ${{ secrets.BOX_KEY }}
+          TAG: ${{ inputs.data_tag }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'data.box' --dir "$RUNNER_TEMP"
+          python seal.py open "$RUNNER_TEMP/data.box" "$RUNNER_TEMP/data.tar"
+          mkdir -p "$MM_BUNDLE_DIR" && tar -xf "$RUNNER_TEMP/data.tar" -C "$MM_BUNDLE_DIR"
+          rm -f "$RUNNER_TEMP/data.box" "$RUNNER_TEMP/data.tar"
+      - name: code
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOX_KEY: ${{ secrets.BOX_KEY }}
+          TAG: ${{ inputs.code_tag }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'code.box' --dir "$RUNNER_TEMP"
+          python seal.py open "$RUNNER_TEMP/code.box" "$RUNNER_TEMP/code.tar.gz"
+          mkdir -p "$RT" && tar -xzf "$RUNNER_TEMP/code.tar.gz" -C "$RT"
+      - uses: actions/cache@v4
+        with:
+          path: /home/runner/.nbc
+          key: nb-${{ inputs.code_tag }}
+      - name: warm
+        run: |
+          cd "$RT" && python -c "import sys; sys.path.insert(0,'.'); import numpy as np; from compute.lib import sim_nb; sim_nb.simulate(np.full(8,.6), np.full(8,.6), 3, 1)"
+          python -c "import sys; sys.path.insert(0,'$RT'); from compute.runtime.ctx import Bundle; Bundle('$MM_BUNDLE_DIR')" > /dev/null
+  shard:
+    needs: prime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      max-parallel: 256
+      matrix:
+        shard: ${{ fromJSON(needs.prime.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: python -m pip install --disable-pip-version-check -q -r requirements.txt
+      - uses: actions/cache/restore@v4
+        with:
+          path: /home/runner/data
+          key: ${{ inputs.data_tag }}
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /home/runner/.nbc
+          key: nb-${{ inputs.code_tag }}
+      - name: code
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOX_KEY: ${{ secrets.BOX_KEY }}
+          TAG: ${{ inputs.code_tag }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'code.box' --dir "$RUNNER_TEMP"
+          python seal.py open "$RUNNER_TEMP/code.box" "$RUNNER_TEMP/code.tar.gz"
+          mkdir -p "$RT" && tar -xzf "$RUNNER_TEMP/code.tar.gz" -C "$RT"
+      - id: work
+        name: work
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set +e
+          python "$RT/entry.py" --output "$RUNNER_TEMP/out" --shard "$SHARD" > /dev/null 2>&1
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+      - name: seal
+        if: always()
+        env:
+          BOX_KEY: ${{ secrets.BOX_KEY }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out" "$RUNNER_TEMP/export"
+          tar -cf "$RUNNER_TEMP/out.tar" -C "$RUNNER_TEMP/out" .
+          python seal.py seal "$RUNNER_TEMP/out.tar" "$RUNNER_TEMP/export/out.box"
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: o-${{ inputs.label }}-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/export/out.box
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+      - name: status
+        env:
+          RC: ${{ steps.work.outputs.rc }}
+        run: test "$RC" = "0"
