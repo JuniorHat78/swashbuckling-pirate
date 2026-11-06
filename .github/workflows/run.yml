@@ -106,6 +106,9 @@ jobs:
     needs: prime
     runs-on: ubuntu-24.04
     timeout-minutes: 340
+    permissions:
+      contents: write   # upload to the run's draft release
+      actions: read
     strategy:
       fail-fast: false
       max-parallel: 256
@@ -155,14 +158,22 @@ jobs:
           mkdir -p "$RUNNER_TEMP/out" "$RUNNER_TEMP/export"
           tar -cf "$RUNNER_TEMP/out.tar" -C "$RUNNER_TEMP/out" .
           python seal.py seal "$RUNNER_TEMP/out.tar" "$RUNNER_TEMP/export/out.box"
-      - if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: o-${{ inputs.label }}-${{ matrix.shard }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/export/out.box
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 3
+      - name: return
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: ${{ inputs.label }}
+          SHARD: ${{ matrix.shard }}
+          ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          # results go to the run's draft release (release storage is not billed; drafts are not public)
+          name="out-${SHARD}-${ATTEMPT}.box"
+          mv "$RUNNER_TEMP/export/out.box" "$RUNNER_TEMP/export/$name"
+          for i in 1 2 3 4 5; do
+            gh release upload "$LABEL" "$RUNNER_TEMP/export/$name" --repo "$GITHUB_REPOSITORY" --clobber && exit 0
+            sleep $((i * 5))
+          done
+          exit 1
       - name: status
         env:
           RC: ${{ steps.work.outputs.rc }}
